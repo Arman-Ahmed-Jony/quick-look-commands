@@ -11,6 +11,7 @@ Read the story first, then use the norms section to see how professional teams a
 | Story | Problem it fixes | Industry norm | Guide |
 |-------|------------------|---------------|-------|
 | [Linux](linux.md) | "Where do things live and who is allowed to touch them?" | FHS, least privilege | [linux/README.md](../linux/README.md) |
+| [Bash Scripting](bash-scripting.md) | Manual deploys and silent pipeline failures | `set -euo pipefail`, shebang, shellcheck | [bash-scripting/README.md](../bash-scripting/README.md) |
 | [Git](git.md) | Two people editing the same code without conflicts | Git Flow, Conventional Commits, semver | [git/README.md](../git/README.md) |
 | [Docker](docker.md) | "Works on my machine" — versions, ports, missing services | One-process containers, image tagging | [docker/README.md](../docker/README.md) |
 | [Logrotate](logrotate.md) | Disk full because logs never stop growing | Retention policies, `/etc/logrotate.d/` | [logrotate/README.md](../logrotate/README.md) |
@@ -35,10 +36,12 @@ These tools stack into one production workflow:
 ```mermaid
 flowchart LR
     Git["Git\n(track + branch code)"] --> Docker
-    Docker["Docker\n(package the app)"] --> systemd
+    Docker["Docker\n(package the app)"] --> Bash
+    Bash["Bash Scripting\n(deploy + automate)"] --> systemd
     systemd["systemd\n(keep it running)"] --> Logrotate
     Logrotate["Logrotate\n(control logs)"]
     Linux["Linux\n(inspect everything)"] -.-> Git
+    Linux -.-> Bash
     Linux -.-> systemd
 ```
 
