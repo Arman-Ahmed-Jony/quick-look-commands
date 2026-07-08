@@ -1140,6 +1140,7 @@ docker system prune -a                   # Cleanup
 
 ## See Also
 
+- [Git](../git/README.md) — branching, merging, tagging, release flow
 - [Linux commands](../linux/README.md) — `ps`, `curl`, permissions, pipes
 - [Logrotate](../logrotate/README.md) — manage container log growth on hosts
 - Official docs: [docs.docker.com](https://docs.docker.com)

@@ -476,6 +476,7 @@ logrotate -f <config>        → force rotate now
 
 ## See Also
 
+- [Git](../git/README.md) — version control, branching, releases
 - `man logrotate`
 - `man 5 logrotate.conf`
 - Linux basics in [`../linux/README.md`](../linux/README.md) — `tail -f`, `grep`, disk usage (`df`, `du`)
