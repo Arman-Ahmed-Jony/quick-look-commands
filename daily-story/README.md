@@ -16,6 +16,7 @@ Read the story first, then use the norms section to see how professional teams a
 | [Docker](docker.md) | "Works on my machine" — versions, ports, missing services | One-process containers, image tagging | [docker/README.md](../docker/README.md) |
 | [Logrotate](logrotate.md) | Disk full because logs never stop growing | Retention policies, `/etc/logrotate.d/` | [logrotate/README.md](../logrotate/README.md) |
 | [systemd](systemd.md) | App dies on SSH close, reboot, or crash | Unit conventions, restart policies | [linux-advanced-topics/systemd.README.md](../linux-advanced-topics/systemd.README.md) |
+| [NGINX](nginx.md) | Exposed app ports, 502/504, broken WebSockets and OAuth | `proxy_pass`, forwarded headers, upstream blocks | [nginx/README.md](../nginx/README.md) |
 
 ---
 
@@ -38,7 +39,8 @@ flowchart LR
     Git["Git\n(track + branch code)"] --> Docker
     Docker["Docker\n(package the app)"] --> Bash
     Bash["Bash Scripting\n(deploy + automate)"] --> systemd
-    systemd["systemd\n(keep it running)"] --> Logrotate
+    systemd["systemd\n(keep it running)"] --> NGINX
+    NGINX["NGINX\n(route + TLS)"] --> Logrotate
     Logrotate["Logrotate\n(control logs)"]
     Linux["Linux\n(inspect everything)"] -.-> Git
     Linux -.-> Bash
