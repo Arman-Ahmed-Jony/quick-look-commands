@@ -25,10 +25,14 @@ This guide is a **console lab**. You will build a small demo, force CPU high, wa
 9. [Force Scaling](#force-scaling)
 10. [What Happens Internally](#what-happens-internally)
 11. [Production Parallel](#production-parallel)
-12. [Troubleshooting](#troubleshooting)
-13. [Cleanup](#cleanup)
-14. [Quick Reference](#quick-reference)
-15. [Further Reading](#further-reading)
+12. [How the Pieces Are Wired (and Why)](#how-the-pieces-are-wired-and-why)
+13. [From a GitHub Backend to Auto Scaling](#from-a-github-backend-to-auto-scaling)
+14. [Health Checks: `/health` vs `/ready`](#health-checks-health-vs-ready)
+15. [Secrets](#secrets)
+16. [Troubleshooting](#troubleshooting)
+17. [Cleanup](#cleanup)
+18. [Quick Reference](#quick-reference)
+19. [Further Reading](#further-reading)
 
 ---
 
@@ -564,11 +568,232 @@ This lab taught the runtime path (scale with load). Rolling deployments are the 
 
 ---
 
+## How the Pieces Are Wired (and Why)
+
+There are two loops: **traffic** and **capacity**.
+
+```text
+Users
+  → ALB (one public DNS)
+    → Target Group (only healthy instances)
+      → EC2 A / B / C (created by the ASG)
+
+CloudWatch (CPU, request count, …)
+  → ASG scaling policy (e.g. keep avg CPU near 70%)
+    → ASG launches or terminates using the Launch Template
+      → Launch Template = AMI + instance type + security group + (optional) User Data
+```
+
+```mermaid
+flowchart TB
+    subgraph traffic["Traffic loop"]
+        U[Users] --> ALBw[ALB]
+        ALBw --> TGw[Target Group]
+        TGw --> ECw[EC2 fleet]
+    end
+    subgraph capacity["Capacity loop"]
+        CWw[CloudWatch] --> ASGw[ASG policy]
+        ASGw --> LTw[Launch Template]
+        LTw --> ECw
+    end
+```
+
+| Piece | Role | Why we use it |
+|-------|------|----------------|
+| **AMI** | Frozen disk with app / runtime | Every new box is identical |
+| **Launch Template** | Recipe for a new EC2 | ASG must know *how* to create instances |
+| **ASG** | Owns min / desired / max | Creates and kills EC2s — no manual SSH scaling |
+| **Target Group** | Health-checked pool | Unhealthy instances get no traffic |
+| **ALB** | Front door | One URL; many backends |
+| **CloudWatch** | Metrics | Observes load only — does **not** launch instances |
+| **Scaling policy** | Target tracking (CPU 70%, …) | Removes guessing “how many servers?” |
+
+**Request path:** user → ALB → healthy target → your app on that EC2.
+
+**Scale path:** high load → CloudWatch metric → ASG decides → Launch Template → new EC2 → registers in Target Group → ALB starts using it.
+
+**Why this shape:** one IP/DNS never becomes the bottleneck; failed instances are cut out by health checks; capacity follows demand within min/max so you do not overpay at night or melt on spikes.
+
+---
+
+## From a GitHub Backend to Auto Scaling
+
+Auto Scaling does **not** pull from GitHub by itself. GitHub is for **building an image**; the ASG scales **running copies** of that image.
+
+```text
+Push to GitHub
+  → CI (GitHub Actions) builds and tests
+  → Build an EC2 AMI (Packer / EC2 Image Builder) with:
+       - runtime (Node, Java, Go, …)
+       - release artifact (or a pinned clone)
+       - systemd (or similar) to start the API
+       - a health endpoint the Target Group can hit
+  → New Launch Template version (new AMI)
+  → ASG instance refresh → old instances drain, new ones serve
+```
+
+### What the backend needs
+
+- **Stateless API** — sessions in Redis/DB, not on local disk
+- **Shared database** (e.g. RDS) outside the ASG
+- **Health-check URL** the Target Group can call (see next section)
+- **Secrets** from AWS at runtime — not committed to a public repo (see [Secrets](#secrets))
+
+### User Data vs baked AMI
+
+| Approach | Idea | Trade-off |
+|----------|------|-----------|
+| **Bake AMI** (preferred) | App already installed in the image | Fast, repeatable scale-out |
+| **User Data clone** | Each boot: `git clone` + install + start | Fine for demos; slower and less deterministic in prod |
+
+### Scaling signals for an API
+
+| Metric | When it fits |
+|--------|----------------|
+| Average CPU ~70% | CPU-bound work (same as this lab) |
+| ALB RequestCountPerTarget | Typical HTTP APIs |
+| Custom (queue depth) | Async workers |
+
+### Same idea, different unit
+
+| Approach | What scales |
+|----------|-------------|
+| EC2 + ASG (this guide) | VMs |
+| ECS / Fargate + ALB | Containers built from the same GitHub repo |
+| Elastic Beanstalk / App Runner | Less DIY; still “build artifact → scale replicas” |
+
+**Key idea:** build once → immutable image → ASG (or ECS) scales copies behind an ALB. GitHub is the source of truth for code; Auto Scaling only manages how many copies run.
+
+---
+
+## Health Checks: `/health` vs `/ready`
+
+The Target Group needs **some** HTTP path that returns **200** when the instance should receive traffic. AWS does not special-case the path name — `/`, `/health`, and `/ready` are all just URLs you configure.
+
+### What AWS does
+
+1. You set the Target Group health check path (e.g. `/ready`).
+2. On a schedule, the ALB sends `GET` to that path on each instance.
+3. **Success** (usually HTTP 200) → target **healthy** → ALB sends user traffic.
+4. **Failure** (timeout, 5xx, connection refused, …) → after enough failures → **unhealthy** → ALB stops sending traffic.
+5. If the ASG uses **ELB health checks**, a long-unhealthy instance may be **replaced**.
+
+### What to put in the backend repo
+
+You do **not** need both endpoints for ALB + ASG.
+
+| Setup | When to use |
+|-------|-------------|
+| **One path only** (`/health` *or* `/ready`) | Enough for most backends behind an ALB |
+| **Both** | Optional; useful later in Kubernetes/ECS where liveness ≠ readiness |
+
+**Practical convention:** expose one dedicated route, no auth:
+
+```text
+GET /health  →  200  { "status": "ok" }
+```
+
+or, if you prefer readiness naming:
+
+```text
+GET /ready   →  200 when the process can take traffic
+             →  503 when a critical dependency is down (optional stricter check)
+```
+
+| Path name (app convention) | Typical meaning |
+|----------------------------|-----------------|
+| `/health` / `/live` | Process is up |
+| `/ready` | Process up **and** deps OK (DB, Redis, …) — if you implement that |
+
+Keep the handler cheap. Point the Target Group at **that one path**. This lab used `/` because Apache served `index.html` there; a real API should use `/health` or `/ready` instead of an authenticated business route.
+
+Also worth having in the repo: listen on a fixed port, start on boot (systemd / Docker `CMD`), stay **stateless**.
+
+---
+
+## Secrets
+
+For an ASG-backed backend: **keep secrets out of GitHub and out of the AMI**. Inject them at **runtime** on each instance.
+
+### What not to do
+
+- Commit `.env` / API keys to a public (or any) repo
+- Bake passwords into the AMI
+- Put secret values in Launch Template User Data in plain text (visible in the console / API)
+
+### Recommended pattern
+
+```text
+Secrets live in AWS (SSM Parameter Store or Secrets Manager)
+  → EC2 IAM role allows read
+  → App (or boot script) fetches secrets on start
+  → App uses them as env vars / config in memory
+```
+
+```mermaid
+flowchart LR
+    Store[SSM or Secrets Manager] --> Role[IAM instance profile]
+    Role --> Boot[App boot on EC2]
+    Boot --> App[API process]
+    ASGsec[ASG] --> EC2sec[Each new instance]
+    EC2sec --> Role
+```
+
+### 1. Store secrets in AWS
+
+| Option | Best for |
+|--------|----------|
+| **SSM Parameter Store** (`SecureString`) | Simple key/value secrets (e.g. `/myapp/prod/DATABASE_URL`) |
+| **Secrets Manager** | JSON blobs, managed rotation (especially RDS passwords) |
+
+### 2. Attach an IAM instance profile to the Launch Template
+
+Every ASG instance assumes the same role. Scope the policy to the specific parameter/secret ARNs (`ssm:GetParameter`, `secretsmanager:GetSecretValue`, plus `kms:Decrypt` if needed).
+
+### 3. Load secrets at startup
+
+| Approach | How |
+|----------|-----|
+| **App SDK** | On boot, fetch from SSM / Secrets Manager, then listen |
+| **Boot script** | `ExecStartPre` or User Data pulls values into a root-only env file, then starts the app |
+| **ECS / Fargate later** | Task definition can inject secrets more cleanly than raw EC2 |
+
+Same env var **names** in code (`DATABASE_URL`, `JWT_SECRET`); different **source** locally vs AWS.
+
+### 4. Wire into Auto Scaling
+
+Launch Template gets:
+
+- AMI with your app
+- **IAM instance profile** (can read secrets)
+- User Data that **starts** the service — not the secret values themselves
+
+When the ASG launches instance #2 or #3, each one uses the same role and fetches the same secrets. No hand-copying.
+
+### Local vs AWS
+
+| Environment | Secrets |
+|-------------|---------|
+| Local / laptop | `.env` (gitignored) or similar |
+| AWS ASG | SSM SecureString or Secrets Manager + IAM role |
+
+### Checklist
+
+1. Put DB URL, JWT secret, API keys in **SSM** or **Secrets Manager**
+2. Add an **IAM role** on the Launch Template
+3. Teach the app (or start script) to **fetch on boot**
+4. Optionally make `/ready` succeed only after secrets and deps are OK
+5. Never commit real values to the GitHub repo
+
+**Quick pick:** learning / small app → SSM Parameter Store SecureString. Prod with password rotation → Secrets Manager.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |
 |---------|--------------|-----|
-| Target stuck **unhealthy** | httpd not running, wrong port, SG blocks ALB → instance :80 | Check User Data / AMI; allow `alb-sg` → `web-server-sg` :80; curl `/` on the instance |
+| Target stuck **unhealthy** | App not listening, wrong health path/port, SG blocks ALB → instance | Allow `alb-sg` → instance SG on app port; curl the health path on the instance; match Target Group path (`/`, `/health`, or `/ready`) |
 | ALB times out from browser | ALB not internet-facing, wrong SG, or no healthy targets | Confirm listener :80, `alb-sg` allows 0.0.0.0/0:80, ≥1 healthy target |
 | ASG never scales out | CPU not high long enough; max already reached; wrong metric | Run `stress` longer; check max ≥ 2; confirm target tracking on ASG CPU |
 | New instance has no Hello page | AMI taken before httpd was ready; User Data failed | Recreate AMI from a verified instance; inspect `cloud-init` logs |
@@ -576,6 +801,8 @@ This lab taught the runtime path (scale with load). Rolling deployments are the 
 | AMI stuck **pending** | Snapshot still copying | Wait; do not point Launch Template at a pending AMI |
 | Scale-in feels “stuck” | Cooldown / stabilization; ALB connection draining | Wait; check ASG Activity and instance protection settings |
 | Wrong AZ / subnet errors | ALB or ASG missing multi-AZ subnets | Attach ≥2 public subnets in different AZs |
+| App up but Target Group unhealthy | Health check hits `/` or wrong path; app only has `/health` | Set Target Group path to your real health URL; ensure it returns 200 without auth |
+| App crashes on boot in ASG | Missing secrets / IAM cannot read SSM | Attach instance profile; verify parameter names and KMS permissions |
 
 ---
 
@@ -635,6 +862,15 @@ ASG creates/terminates EC2 from Launch Template (AMI)
 CloudWatch observes → ASG decides → capacity changes
 ```
 
+### Real backend checklist
+
+```
+GitHub → CI → AMI → Launch Template version → ASG refresh
+Health path → /health or /ready (one is enough for ALB)
+Secrets → SSM SecureString or Secrets Manager + IAM instance profile
+Never → secrets in git, AMI, or plain User Data
+```
+
 ---
 
 ## Further Reading
@@ -643,6 +879,9 @@ CloudWatch observes → ASG decides → capacity changes
 - [How target tracking works](https://docs.aws.amazon.com/autoscaling/ec2/userguide/as-scaling-target-tracking.html)
 - [Instance refresh](https://docs.aws.amazon.com/autoscaling/ec2/userguide/asg-instance-refresh.html) — replace the fleet with a new Launch Template version
 - [Application Load Balancer](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/introduction.html)
+- [Target Group health checks](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/target-group-health-checks.html)
+- [SSM Parameter Store](https://docs.aws.amazon.com/systems-manager/latest/userguide/systems-manager-parameter-store.html)
+- [AWS Secrets Manager](https://docs.aws.amazon.com/secretsmanager/latest/userguide/intro.html)
 
 ### What’s next
 
@@ -650,4 +889,4 @@ Once this lab feels natural, learn **rolling deployments / instance refresh**, t
 
 ---
 
-*Based on a hands-on dummy Auto Scaling project: immutable AMI, Launch Template, Target Group, ALB, ASG capacity, and CPU target tracking — from one server to a fleet that scales with load.*
+*Based on a hands-on dummy Auto Scaling project: immutable AMI, Launch Template, Target Group, ALB, ASG capacity, and CPU target tracking — from one server to a fleet that scales with load. Extended with wiring, GitHub → AMI flow, health-check conventions, and runtime secrets.*
